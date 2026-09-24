@@ -148,7 +148,7 @@ public static class ConcurrencyDemo
         Console.ResetColor();
     }
 
-    private static async Task<int> ResetDatabaseAsync(int initialStock)
+    internal static async Task<int> ResetDatabaseAsync(int initialStock)
     {
         await using var db = new AppDbContext();
         await db.Database.EnsureDeletedAsync();
