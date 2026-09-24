@@ -18,6 +18,13 @@ public class AppDbContext : DbContext
         modelBuilder.Entity<Product>(b =>
         {
             b.Property(p => p.Name).HasMaxLength(100);
+
+            // The column exists for every context, but here it is NOT a concurrency token,
+            // so the race-condition demo keeps its lost-update behavior.
+            // OptimisticDbContext turns the check on.
+            b.Property(p => p.RowVersion)
+                .HasColumnType("rowversion")
+                .ValueGeneratedOnAddOrUpdate();
         });
 
         modelBuilder.Entity<Order>(b =>

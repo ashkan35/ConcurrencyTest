@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using ConcurrencyTest.Data;
 using Microsoft.EntityFrameworkCore;
 
@@ -7,9 +8,18 @@ namespace ConcurrencyTest;
 /// Runs the same "many buyers at once" scenario against different purchase strategies:
 /// - <see cref="PurchaseWithRaceConditionAsync"/>: unsafe read → modify → save (lost update).
 /// - <see cref="PurchaseWithAtomicUpdateAsync"/>: a single conditional UPDATE executed by SQL Server.
+/// - <see cref="PurchaseWithOptimisticConcurrencyAsync"/>: RowVersion check on save + retry on conflict.
+/// - <see cref="PurchaseWithPessimisticLockAsync"/>: lock the row when reading (UPDLOCK) so buyers queue up.
 /// </summary>
 public static class ConcurrencyDemo
 {
+    // A buyer only loses a round when someone else sold an item in between, so after at most
+    // initialStock conflicts the stock is 0 and the next read ends with "out of stock".
+    // The limit just has to be larger than that; if it is too small, buyers give up while stock remains.
+    private const int MaxOptimisticAttempts = 20;
+
+    private static int _optimisticConflicts;
+
     public static Task RunRaceConditionAsync(int initialStock = 10, int concurrentBuyers = 50)
         => RunScenarioAsync("Race condition (read -> modify -> save)",
             PurchaseWithRaceConditionAsync, initialStock, concurrentBuyers);
@@ -17,6 +27,20 @@ public static class ConcurrencyDemo
     public static Task RunAtomicUpdateAsync(int initialStock = 10, int concurrentBuyers = 50)
         => RunScenarioAsync("Atomic update (ExecuteUpdateAsync)",
             PurchaseWithAtomicUpdateAsync, initialStock, concurrentBuyers);
+
+    public static async Task RunOptimisticConcurrencyAsync(int initialStock = 10, int concurrentBuyers = 50)
+    {
+        _optimisticConflicts = 0;
+
+        await RunScenarioAsync("Optimistic concurrency (RowVersion + retry)",
+            PurchaseWithOptimisticConcurrencyAsync, initialStock, concurrentBuyers);
+
+        Console.WriteLine($"Concurrency conflicts (retries): {_optimisticConflicts}");
+    }
+
+    public static Task RunPessimisticLockAsync(int initialStock = 10, int concurrentBuyers = 50)
+        => RunScenarioAsync("Pessimistic locking (UPDLOCK)",
+            PurchaseWithPessimisticLockAsync, initialStock, concurrentBuyers);
 
     /// <summary>
     /// The unsafe "read → check → modify → save" pattern.
@@ -91,6 +115,108 @@ public static class ConcurrencyDemo
         return true;
     }
 
+    /// <summary>
+    /// Same read → check → modify → save flow as the unsafe version, but through
+    /// <see cref="OptimisticDbContext"/>: the save only succeeds if the row still has the
+    /// RowVersion we read. On conflict the whole flow is repeated with fresh data.
+    /// </summary>
+    public static async Task<bool> PurchaseWithOptimisticConcurrencyAsync(int productId, int buyerId)
+    {
+        await using var db = new OptimisticDbContext();
+
+        for (var attempt = 1; attempt <= MaxOptimisticAttempts; attempt++)
+        {
+            // 1) READ: Stock together with its current RowVersion.
+            var product = await db.Products.SingleAsync(p => p.Id == productId);
+
+            // 2) CHECK: decided on data that may become stale, exactly like the unsafe version.
+            if (product.Stock <= 0)
+            {
+                Console.WriteLine($"Buyer {buyerId,3}: out of stock (attempt {attempt})");
+                return false;
+            }
+
+            // Same simulated work between read and write as the unsafe version.
+            await Task.Delay(100);
+
+            // 3) MODIFY + SAVE.
+            // SQL sent:
+            // UPDATE [Products] SET [Stock] = @p0
+            // OUTPUT INSERTED.[RowVersion]
+            // WHERE [Id] = @p1 AND [RowVersion] = @p2
+            product.Stock -= 1;
+            db.Orders.Add(new Order { ProductId = productId, BuyerId = buyerId, CreatedAt = DateTime.UtcNow });
+
+            try
+            {
+                // SaveChanges runs the UPDATE and the order INSERT in one transaction,
+                // so on a conflict the order is rolled back too.
+                await db.SaveChangesAsync();
+
+                Console.WriteLine($"Buyer {buyerId,3}: bought 1 item (attempt {attempt})");
+                return true;
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                // 0 rows matched: someone else changed the product after we read it.
+                Interlocked.Increment(ref _optimisticConflicts);
+
+                // Forget the stale product and the pending order, then start over with fresh data.
+                db.ChangeTracker.Clear();
+            }
+        }
+
+        Console.WriteLine($"Buyer {buyerId,3}: gave up after {MaxOptimisticAttempts} conflicts");
+        return false;
+    }
+
+    /// <summary>
+    /// Same read → check → modify → save flow as the unsafe version, but the read takes an
+    /// update lock (UPDLOCK) that is held until the transaction ends. The next buyer's locking
+    /// read waits until this transaction commits, so every buyer sees the latest stock.
+    /// </summary>
+    public static async Task<bool> PurchaseWithPessimisticLockAsync(int productId, int buyerId)
+    {
+        await using var db = new AppDbContext();
+
+        // The lock lives as long as this transaction, so the read and the write must be inside it.
+        await using var transaction = await db.Database.BeginTransactionAsync();
+
+        // 1) READ + LOCK: other buyers running this same query wait here until we commit.
+        //    UPDLOCK: update lock, held until the end of the transaction. Only one transaction can
+        //             hold it, but plain SELECTs (shared locks) are not blocked.
+        //    ROWLOCK: lock only this row, not the page or the table.
+        var product = await db.Products
+            .FromSql($"SELECT * FROM Products WITH (UPDLOCK, ROWLOCK) WHERE Id = {productId}")
+            .SingleAsync();
+
+        // 2) CHECK: safe now, nobody else can change this row until we finish.
+        if (product.Stock <= 0)
+        {
+            // Disposing the transaction without commit rolls back and releases the lock.
+            Console.WriteLine($"Buyer {buyerId,3}: out of stock");
+            return false;
+        }
+
+        var stockSeen = product.Stock;
+
+        // Same simulated work between read and write as the unsafe version.
+        // Here it runs while holding the lock, so every other buyer waits for it:
+        // never put slow external calls (payment gateway, HTTP) inside this transaction.
+        await Task.Delay(100);
+
+        // 3) MODIFY + SAVE: the value we read is still the current one.
+        product.Stock -= 1;
+        db.Orders.Add(new Order { ProductId = productId, BuyerId = buyerId, CreatedAt = DateTime.UtcNow });
+        await db.SaveChangesAsync();
+
+        // Commit releases the lock; the next waiting buyer continues with the new stock.
+        await transaction.CommitAsync();
+
+        Console.WriteLine($"Buyer {buyerId,3}: bought 1 item (saw stock = {stockSeen}, wrote stock = {product.Stock})");
+        return true;
+    }
+
     private static async Task RunScenarioAsync(
         string title,
         Func<int, int, Task<bool>> purchaseAsync,
@@ -113,8 +239,10 @@ public static class ConcurrencyDemo
             }))
             .ToArray();
 
+        var stopwatch = Stopwatch.StartNew();
         startGate.SetResult();
         var results = await Task.WhenAll(buyers);
+        stopwatch.Stop();
 
         await using var db = new AppDbContext();
         var finalStock = await db.Products.Where(p => p.Id == productId).Select(p => p.Stock).SingleAsync();
@@ -131,6 +259,7 @@ public static class ConcurrencyDemo
         Console.WriteLine($"Orders saved in DB      : {ordersCount}   (expected: {expectedSales})");
         Console.WriteLine($"Final stock in DB       : {finalStock}   (expected: {initialStock - expectedSales})");
         Console.WriteLine($"Lost stock updates      : {lostUpdates}");
+        Console.WriteLine($"Elapsed time            : {stopwatch.ElapsedMilliseconds} ms");
         Console.WriteLine("=============================================");
 
         if (ordersCount > initialStock || lostUpdates > 0)
